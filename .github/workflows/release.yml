@@ -26,11 +26,11 @@ jobs:
         id: get_version
         shell: pwsh
         run: |
-          $iasContent = Get-Content -Path "IAS.cmd" -Encoding OEM
+          $iasContent = Get-Content -Path "IAS.cmd" -Raw -Encoding OEM
           if ($iasContent -match '@set iasver=(\S+)') {
               $version = "v" + $Matches[1]
               Write-Host "Found version: $version"
-              echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "VERSION=$version"
           } else {
               Write-Error "Could not find iasver in IAS.cmd"
               exit 1
