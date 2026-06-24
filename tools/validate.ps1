@@ -1,6 +1,9 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# Force PowerShell to interpret git output as UTF-8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
 <#
 .SYNOPSIS
 Validates repository text hygiene (EOL + encoding) on Windows runners.
@@ -22,7 +25,9 @@ Notes:
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
 # Ensure legacy code pages (e.g., 936/GBK) are available on .NET Core/PowerShell 7
-[System.Text.Encoding]::RegisterProvider([System.Text.CodePagesEncodingProvider]::Instance)
+try {
+    [System.Text.Encoding]::RegisterProvider([System.Text.CodePagesEncodingProvider]::Instance)
+} catch {}
 
 function Add-Failure {
     param(
@@ -176,6 +181,99 @@ function Probe-CmdSyntax {
     }
 }
 
+function Validate-CmdLabels {
+    param(
+        [string]$Path
+    )
+
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $gbk = [System.Text.Encoding]::GetEncoding(936)
+    $content = $gbk.GetString($bytes)
+    $lines = $content -split '\r?\n'
+
+    $definedLabels = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    for ($i = 0; $i -lt $lines.Length; $i++) {
+        $line = $lines[$i].Trim()
+        if ($line -match '^:([a-zA-Z0-9_-]+)' -and -not $line.StartsWith('::')) {
+            $labelName = $matches[1]
+            if ($labelName -match '^([^:]+):$') {
+                $labelName = $matches[1]
+            }
+            [void]$definedLabels.Add($labelName)
+        }
+    }
+
+    for ($i = 0; $i -lt $lines.Length; $i++) {
+        $line = $lines[$i].Trim()
+        if ($line.StartsWith('::') -or $line.ToLower().StartsWith('rem ')) {
+            continue
+        }
+
+        # Match goto
+        if ($line -match '(?i)\bgoto\s+:?([a-zA-Z0-9_-]+)\b') {
+            $target = $matches[1]
+            if ($target.ToLower() -ne 'eof' -and -not $definedLabels.Contains($target)) {
+                Add-Failure -File $Path -Message "Line $($i+1): Found 'goto' referencing undefined label ':$target'."
+            }
+        }
+        # Match call
+        if ($line -match '(?i)\bcall\s+:([a-zA-Z0-9_-]+)\b') {
+            $target = $matches[1]
+            if ($target.ToLower() -ne 'eof' -and -not $definedLabels.Contains($target)) {
+                Add-Failure -File $Path -Message "Line $($i+1): Found 'call' referencing undefined label ':$target'."
+            }
+        }
+    }
+}
+
+function Validate-Parentheses {
+    param(
+        [string]$Path
+    )
+
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $gbk = [System.Text.Encoding]::GetEncoding(936)
+    $content = $gbk.GetString($bytes)
+    $lines = $content -split '\r?\n'
+
+    $balance = 0
+    $firstOpenLine = 0
+
+    for ($i = 0; $i -lt $lines.Length; $i++) {
+        $line = $lines[$i].Trim()
+        if ($line.StartsWith('::') -or $line.ToLower().StartsWith('rem ')) {
+            continue
+        }
+
+        # Remove double-quoted strings
+        $cleanLine = $line -replace '"[^"]*"', ''
+        # Remove escaped parentheses
+        $cleanLine = $cleanLine -replace '\^\(', ''
+        $cleanLine = $cleanLine -replace '\^\)', ''
+
+        for ($j = 0; $j -lt $cleanLine.Length; $j++) {
+            $char = $cleanLine[$j]
+            if ($char -eq '(') {
+                if ($balance -eq 0) {
+                    $firstOpenLine = $i + 1
+                }
+                $balance++
+            }
+            elseif ($char -eq ')') {
+                $balance--
+                if ($balance -lt 0) {
+                    Add-Failure -File $Path -Message "Line $($i+1): Unexpected closing parenthesis ')'."
+                    return
+                }
+            }
+        }
+    }
+
+    if ($balance -ne 0) {
+        Add-Failure -File $Path -Message "Unclosed parenthesis '(' starting at line $firstOpenLine."
+    }
+}
+
 $script:Failures = @()
 
 $trackedFiles = (git -C $repoRoot -c core.quotePath=false ls-files -z) -split "`0" | Where-Object { $_ }
@@ -193,6 +291,8 @@ foreach ($file in $trackedFiles) {
 $cmdFiles = (git -C $repoRoot -c core.quotePath=false ls-files -z -- '*.cmd') -split "`0" | Where-Object { $_ }
 foreach ($file in $cmdFiles) {
     Validate-Encoding -Path $file
+    Validate-CmdLabels -Path $file
+    Validate-Parentheses -Path $file
 }
 
 Probe-CmdSyntax

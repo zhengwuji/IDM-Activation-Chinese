@@ -15,16 +15,16 @@ goto :checks
 
 :elevate
 echo [提示] 正在请求管理员权限，请在弹出的窗口中点击"是"...
-where powershell.exe >nul 2>&1 || goto :noPS
-powershell -NoProfile -Command "Start-Process -FilePath '%self%' -Verb RunAs"
+where powershell.exe >nul 2>&1 && (
+    powershell -NoProfile -Command "Start-Process -FilePath '%self%' -Verb RunAs" && exit /b
+)
+:: Fallback to VBScript elevation if PowerShell failed or isn't available
+set "vbsElevate=%temp%\__ias_elevate.vbs"
+echo Set UAC = CreateObject^("Shell.Application"^) > "%vbsElevate%"
+echo UAC.ShellExecute "%self%", "", "", "runas", 1 >> "%vbsElevate%"
+cscript //nologo "%vbsElevate%" >nul 2>&1
+del /f /q "%vbsElevate%" >nul 2>&1
 exit /b
-
-:noPS
-echo [×] 未找到 PowerShell，无法自动提权。
-echo     请右键本文件，选择"以管理员身份运行"。
-pause
-exit /b 1
-
 :checks
 if not exist "%IAS%" (
     echo [×] 未找到 IAS.cmd，请确认本文件与 IAS.cmd 在同一文件夹。
@@ -44,18 +44,26 @@ echo:
 echo [√] 已获取管理员权限
 echo [√] 已找到 IAS.cmd
 
-where powershell.exe >nul 2>&1 && (
+where powershell.exe >nul 2>&1
+if %errorlevel% equ 0 (
     echo [√] PowerShell 可用
-    for /f "delims=" %%a in ('powershell -NoProfile -Command "$ExecutionContext.SessionState.LanguageMode" 2^>nul') do set "psmode=%%a"
-    if defined psmode if /i not "!psmode!"=="FullLanguage" (
+    for /f "tokens=1,2,3 delims=;" %%a in ('powershell -NoProfile -Command "$lang=$ExecutionContext.SessionState.LanguageMode; $net=$false; if($lang -eq 'FullLanguage'){try{$t=New-Object System.Net.Sockets.TcpClient;$async=$t.BeginConnect('internetdownloadmanager.com',80,$null,$null);if($async.AsyncWaitHandle.WaitOne(1500,$false)){$t.EndConnect($async);$net=$true};$t.Close()}catch{}}else{try{$net=(Test-NetConnection internetdownloadmanager.com -Port 80 -WarningAction SilentlyContinue).TcpTestSucceeded}catch{}}; $wmi=0; try{$null=Get-CimInstance Win32_OperatingSystem -ErrorAction Stop;$wmi=1}catch{}; Write-Output ($lang + ';' + $net + ';' + $wmi)" 2^>nul') do (
+        set "psmode=%%a"
+        set "netok=%%b"
+        if "%%c"=="1" set "wmiok=ok"
+    )
+) else (
+    echo [×] 系统未找到 PowerShell
+    set /a issues+=1
+    if not defined firstFail set "firstFail=系统未找到 PowerShell，参见 README 常见问题 Q6"
+)
+
+if defined psmode (
+    if /i not "!psmode!"=="FullLanguage" (
         echo [×] PowerShell 语言模式为 !psmode! （可能被组织策略限制）
         set /a issues+=1
         if not defined firstFail set "firstFail=PowerShell 语言模式受限，参见 README 常见问题 Q6"
     )
-) || (
-    echo [×] 系统未找到 PowerShell
-    set /a issues+=1
-    if not defined firstFail set "firstFail=系统未找到 PowerShell，参见 README 常见问题 Q6"
 )
 
 sc query Null | find /i "RUNNING" >nul 2>&1 && (
@@ -66,15 +74,15 @@ sc query Null | find /i "RUNNING" >nul 2>&1 && (
     if not defined firstFail set "firstFail=Null 服务未运行，可在管理员 CMD 执行 sc start Null 后重试"
 )
 
-set "netok="
-ping -4 -n 1 internetdownloadmanager.com >nul 2>&1 && set "netok=ping"
-if not defined netok (
-    for /f "delims=" %%a in ('powershell -NoProfile -Command "(Test-NetConnection internetdownloadmanager.com -Port 80 -WarningAction SilentlyContinue).TcpTestSucceeded" 2^>nul') do set "netok=%%a"
-)
+set "isNetOk="
 if /i "!netok!"=="True" (
+    set "isNetOk=ok"
+) else (
+    ping -4 -n 1 internetdownloadmanager.com >nul 2>&1 && set "isNetOk=ok"
+)
+
+if defined isNetOk (
     echo [√] 可连接 internetdownloadmanager.com
-) else if /i "!netok!"=="ping" (
-    echo [√] 网络可达 internetdownloadmanager.com
 ) else (
     echo [×] 无法连接 internetdownloadmanager.com（检查网络/代理/VPN；不影响本地激活）
     set /a issues+=1
@@ -92,9 +100,9 @@ if defined cpok (
     if not defined firstFail set "firstFail=代码页非 936，可执行 chcp 936 后重试，参见 README 常见问题 Q4"
 )
 
-set "wmiok="
-for /f "delims=" %%a in ('powershell -NoProfile -Command "try{$null=Get-CimInstance Win32_OperatingSystem -ErrorAction Stop;Write-Output 1}catch{Write-Output 0}" 2^>nul') do if "%%a"=="1" set "wmiok=ok"
-if not defined wmiok wmic path Win32_OperatingSystem get Caption /value >nul 2>&1 && set "wmiok=ok"
+if not defined wmiok (
+    wmic path Win32_OperatingSystem get Caption /value >nul 2>&1 && set "wmiok=ok"
+)
 if defined wmiok (
     echo [√] WMI/CIM 可用
 ) else (
@@ -120,6 +128,12 @@ if not defined idmPath (
     if exist "%ProgramFiles(x86)%\Internet Download Manager\IDMan.exe" set "idmPath=%ProgramFiles(x86)%\Internet Download Manager"
     if not defined idmPath if exist "%ProgramFiles%\Internet Download Manager\IDMan.exe" set "idmPath=%ProgramFiles%\Internet Download Manager"
 )
+if not defined idmPath (
+    if exist "%~dp0IDMan.exe" (
+        set "idmPath=%~dp0"
+        if "!idmPath:~-1!"=="\" set "idmPath=!idmPath:~0,-1!"
+    )
+)
 if defined idmPath (
     if exist "!idmPath!\IDMan.exe" (
         echo [√] 已检测到 IDM 安装路径: !idmPath!
@@ -131,7 +145,7 @@ if defined idmPath (
 ) else (
     echo [×] 未在注册表找到 IDM 安装路径
     set /a issues+=1
-    if not defined firstFail set "firstFail=未安装 IDM，请先安装 IDM，参见 README 常见问题 Q2"
+    if not defined firstFail set "firstFail=未安装 IDM。绿色/便携版用户可将本脚本解压到 IDM 安装目录后运行"
 )
 
 set "writeTest=%~dp0.__ias_write_test.tmp"

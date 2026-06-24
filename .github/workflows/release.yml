@@ -1,0 +1,125 @@
+name: Auto Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run EOL and encoding checks
+        shell: pwsh
+        run: ./tools/validate.ps1
+
+      - name: Extract version from IAS.cmd
+        id: get_version
+        shell: pwsh
+        run: |
+          $iasContent = Get-Content -Path "IAS.cmd" -Encoding OEM
+          if ($iasContent -match '@set iasver=(\S+)') {
+              $version = "v" + $Matches[1]
+              Write-Host "Found version: $version"
+              echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+          } else {
+              Write-Error "Could not find iasver in IAS.cmd"
+              exit 1
+          }
+
+      - name: Check if release exists
+        id: check_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release $VERSION already exists. Skipping."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Release $VERSION does not exist. Creating."
+          fi
+
+      - name: Build Package and Release Notes
+        if: steps.check_release.outputs.exists == 'false'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          # 1. Clean version string (remove 'v' prefix for parsing notes)
+          $verNum = $env:VERSION.Substring(1)
+          
+          # 2. Extract release notes from CHANGELOG.md
+          $changelog = Get-Content -Path "CHANGELOG.md" -Raw
+          # Handle CRLF vs LF line endings cleanly
+          $changelog = $changelog -replace "`r`n", "`n"
+          $pattern = "(?s)##\s+$verNum\b[^\n]*\n(.*?)(?=\n##\s|\n---|\Z)"
+          if ($changelog -match $pattern) {
+              $notes = $Matches[1].Trim()
+          } else {
+              $notes = "IDM 激活脚本中文版 $env:VERSION 自动发布。"
+          }
+          Set-Content -Path "release_notes.md" -Value $notes -Encoding utf8
+
+          # 3. Create zip archive
+          $zipName = "IDM-Activation-Script-$env:VERSION.zip"
+          $filesToPack = @(
+              "开始激活.cmd",
+              "IAS.cmd",
+              "使用说明.txt",
+              "README.md",
+              "CHANGELOG.md",
+              "LICENSE",
+              "SECURITY.md"
+          )
+          
+          New-Item -ItemType Directory -Force -Path "release_build" | Out-Null
+          foreach ($file in $filesToPack) {
+              Copy-Item -Path $file -Destination "release_build"
+          }
+          
+          if (Test-Path $zipName) { Remove-Item $zipName -Force }
+          Compress-Archive -Path "release_build\*" -DestinationPath $zipName -Force
+          Remove-Item -Recurse -Force "release_build"
+
+          # 4. Compute SHA256 hash
+          $hash = (Get-FileHash -Path $zipName -Algorithm SHA256).Hash.ToLower()
+          $hashContent = "$hash *$zipName"
+          Set-Content -Path "$zipName.sha256" -Value $hashContent -Encoding ascii
+          
+          Write-Host "Successfully built package: $zipName"
+
+      - name: Create Git Tag and GitHub Release
+        if: steps.check_release.outputs.exists == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          # Configure Git
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # Create and push tag
+          git tag "$VERSION"
+          git push origin "$VERSION"
+          
+          # Create release
+          gh release create "$VERSION" \
+            "IDM-Activation-Script-$VERSION.zip" \
+            "IDM-Activation-Script-$VERSION.zip.sha256" \
+            -t "IDM-Activation-Script-Chinese $VERSION" \
+            -F release_notes.md
+          
+          echo "Successfully created release $VERSION."
